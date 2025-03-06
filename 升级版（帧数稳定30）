@@ -1,0 +1,717 @@
+from flask import Flask, Response, request
+from picamera2 import Picamera2
+import cv2
+import time
+import threading
+import numpy as np
+import os
+import signal
+import sys
+import logging
+import socket
+
+# 使用当前用户的主目录
+home_dir = os.path.expanduser("~")
+log_file = os.path.join(home_dir, "camera_server.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(log_file)
+    ]
+)
+logger = logging.getLogger('camera_server')
+
+app = Flask(__name__)
+picam2 = None
+camera_lock = threading.Lock()
+running = True
+last_client_time = time.time()
+active_clients = 0
+max_clients = 5
+clients_lock = threading.Lock()
+health_check_interval = 30
+
+# 添加帧超时检测变量
+last_frame_time = 0
+frame_timeout = 5  # 5秒没有新帧就重启摄像头
+
+# 监控摄像头性能的变量
+frame_times = []
+fps_stats = {"current": 0, "min": 0, "max": 0, "avg": 0}
+stats_lock = threading.Lock()
+latest_frame = None  # 存储最新的帧
+frame_lock = threading.Lock()  # 用于保护latest_frame
+
+# 用于控制图像处理复杂度的标志
+reduce_processing = False  # 默认使用完整处理
+frame_counter = 0
+
+# 添加预处理的查找表，以加速颜色调整
+b_lut = np.clip(np.arange(0, 256) * 0.75, 0, 255).astype(np.uint8)
+g_lut = np.arange(0, 256).astype(np.uint8)
+r_lut = np.clip(np.arange(0, 256) * 1.15, 0, 255).astype(np.uint8)
+
+# 创建亮度对比度查找表
+alpha_beta_lut = np.clip(np.arange(0, 256) * 1.1 + 15, 0, 255).astype(np.uint8)
+
+# 将已编码的帧缓存
+encoded_frames_cache = []
+encoded_frames_cache_lock = threading.Lock()
+frame_cache_size = 3
+frame_cache_index = 0
+
+# 添加时间戳缓存变量
+last_timestamp = ""
+last_timestamp_update = 0
+timestamp_update_interval = 1.0  # 时间戳每秒更新一次，但每帧都显示
+
+def signal_handler(sig, frame):
+    global running
+    logger.info("正在关闭摄像头服务...")
+    running = False
+    if picam2 is not None:
+        try:
+            picam2.stop()
+        except Exception as e:
+            logger.error(f"关闭摄像头时出错: {e}")
+    sys.exit(0)
+
+# 注册信号处理器
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+def get_ip_address():
+    try:
+        # 获取本机IP地址(非回环地址)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception as e:
+        logger.error(f"获取IP地址失败: {e}")
+        return "127.0.0.1"
+
+def reset_camera():
+    """重置摄像头，在出现问题时调用"""
+    global picam2
+    logger.warning("正在重置摄像头...")
+    
+    with camera_lock:
+        if picam2 is not None:
+            try:
+                picam2.stop()
+                logger.info("摄像头已停止")
+            except Exception as e:
+                logger.error(f"停止摄像头时出错: {e}")
+            finally:
+                picam2 = None
+    
+    # 等待一段时间再重新初始化
+    time.sleep(2)
+    return init_camera()
+
+def init_camera():
+    global picam2, last_frame_time
+    try:
+        if picam2 is not None:
+            try:
+                picam2.stop()
+                time.sleep(2)
+            except:
+                pass
+            picam2 = None
+            
+        logger.info("初始化摄像头...")
+        for attempt in range(3):
+            try:
+                picam2 = Picamera2()
+                
+                # 保持原有分辨率
+                config = picam2.create_video_configuration(
+                    main={
+                        "size": (640, 480),
+                        "format": "RGB888"  # 使用RGB格式
+                    },
+                    buffer_count=4,  # 增加缓冲区数量
+                    controls={
+                        "FrameDurationLimits": (33333, 33333),  # 约30fps
+                        "AwbEnable": True,     # 保持自动白平衡
+                        "AwbMode": 1,          # 使用日光模式
+                        "Brightness": 0.1,      # 轻微提高亮度
+                        "Contrast": 1.0,        # 默认对比度
+                        "Saturation": 1.1,      # 轻微提高饱和度
+                        "Sharpness": 1.0,       # 默认锐度
+                        "ExposureValue": 0.2,   # 曝光补偿
+                        "ColourGains": (1.4, 1.2),  # 更温和的红绿增益
+                        "NoiseReductionMode": 0  # 禁用噪声减少以提高性能
+                    }
+                )
+                
+                picam2.configure(config)
+                time.sleep(0.5)  # 减少等待时间
+                
+                picam2.start()
+                logger.info(f"摄像头初始化成功 (尝试 {attempt+1}/3)")
+                
+                # 丢弃前几帧
+                for _ in range(5):  # 减少丢弃的帧数
+                    picam2.capture_array()
+                    time.sleep(0.03)
+                
+                last_frame_time = time.time()
+                return True
+            except Exception as e:
+                logger.error(f"摄像头初始化尝试 {attempt+1}/3 失败: {e}")
+                if picam2 is not None:
+                    try:
+                        picam2.stop()
+                    except:
+                        pass
+                    picam2 = None
+                time.sleep(2)
+        return False
+    except Exception as e:
+        logger.error(f"初始化摄像头过程中发生错误: {e}")
+        return False
+
+def adjust_colors_fast(frame):
+    """使用查找表快速调整颜色"""
+    try:
+        if frame is None or frame.size == 0:
+            return None
+            
+        # 使用OpenCV的split/LUT/merge操作，这些操作经过高度优化
+        b, g, r = cv2.split(frame)
+        b = cv2.LUT(b, b_lut)
+        r = cv2.LUT(r, r_lut)
+        
+        # 使用优化的合并操作
+        adjusted = cv2.merge([b, g, r])
+        
+        # 使用查找表进行亮度和对比度调整，避免逐像素计算
+        adjusted = cv2.LUT(adjusted, alpha_beta_lut)
+        
+        return adjusted
+        
+    except Exception as e:
+        logger.error(f"快速颜色调整出错: {e}")
+        return frame
+
+# 预先创建时间戳字体和位置
+font = cv2.FONT_HERSHEY_SIMPLEX
+font_scale = 0.5
+font_color = (255, 255, 255)  # 白色
+font_thickness = 1
+text_position = (10, 20)
+
+def add_timestamp(frame):
+    """优化的时间戳添加函数，显示时间戳和FPS"""
+    global last_timestamp, last_timestamp_update
+    
+    current_time = time.time()
+    
+    # 每秒更新一次时间戳文本
+    if current_time - last_timestamp_update >= timestamp_update_interval:
+        last_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        last_timestamp_update = current_time
+    
+    # 获取当前FPS
+    with stats_lock:
+        current_fps = fps_stats["current"]
+    fps_text = f"FPS: {current_fps:.1f}"
+    
+    # 获取文本大小
+    timestamp_size = cv2.getTextSize(last_timestamp, font, font_scale, font_thickness)[0]
+    fps_size = cv2.getTextSize(fps_text, font, font_scale, font_thickness)[0]
+    
+    # 计算背景区域（包含时间戳和FPS）
+    bg_rect_x1 = text_position[0] - 5
+    bg_rect_y1 = text_position[1] - timestamp_size[1] - 5
+    bg_rect_x2 = text_position[0] + max(timestamp_size[0], fps_size[0]) + 5
+    bg_rect_y2 = text_position[1] + fps_size[1] + 10  # 增加高度以容纳FPS
+    
+    # 绘制半透明背景
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (bg_rect_x1, bg_rect_y1), (bg_rect_x2, bg_rect_y2), (0, 0, 0), -1)
+    
+    # 合并半透明背景 (70% 透明度)
+    alpha = 0.7
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    
+    # 添加时间戳文本
+    cv2.putText(frame, last_timestamp, text_position, font, font_scale, font_color, font_thickness)
+    
+    # 添加FPS文本（在时间戳下方）
+    fps_position = (text_position[0], text_position[1] + fps_size[1] + 5)
+    cv2.putText(frame, fps_text, fps_position, font, font_scale, font_color, font_thickness)
+    
+    return frame
+
+def update_fps_stats(frame_time):
+    global fps_stats
+    with stats_lock:
+        # 保留最近5帧的时间，减少计算量
+        frame_times.append(frame_time)
+        if len(frame_times) > 5:
+            frame_times.pop(0)
+            
+        # 计算FPS
+        if len(frame_times) > 1:
+            # 使用更简单的FPS计算方法
+            if len(frame_times) >= 2:
+                elapsed = frame_times[-1] - frame_times[0]
+                if elapsed > 0:
+                    fps = (len(frame_times) - 1) / elapsed
+                    
+                    fps_stats["current"] = fps
+                    if fps_stats["min"] == 0 or fps < fps_stats["min"]:
+                        fps_stats["min"] = fps
+                    if fps > fps_stats["max"]:
+                        fps_stats["max"] = fps
+                    # 使用简单平均而不是加权平均
+                    fps_stats["avg"] = fps
+
+def process_frame(frame):
+    """集中处理帧的函数，便于测量性能"""
+    start_time = time.time()
+    
+    # 1. 颜色调整
+    adjusted = adjust_colors_fast(frame)
+    
+    # 2. 添加时间戳 - 修改为每一帧都添加时间戳
+    adjusted = add_timestamp(adjusted)
+    
+    # 记录处理时间（仅用于调试）
+    if frame_counter % 30 == 0:  # 每30帧记录一次
+        process_time = (time.time() - start_time) * 1000
+        logger.debug(f"帧处理时间: {process_time:.2f}ms")
+    
+    return adjusted
+
+def capture_continuous():
+    """优化的帧捕获函数"""
+    global picam2, running, latest_frame, last_frame_time, frame_counter
+    
+    logger.info("开始后台帧捕获线程")
+    last_successful_capture = time.time()
+    
+    # 动态调整捕获速率
+    target_interval = 1.0/30.0  # 开始尝试30fps
+    skip_frames = 0
+    
+    while running:
+        try:
+            current_time = time.time()
+            
+            # 丢帧以控制CPU使用
+            if skip_frames > 0:
+                skip_frames -= 1
+                time.sleep(0.01)
+                continue
+                
+            if picam2 is None:
+                if not init_camera():
+                    time.sleep(1)
+                    continue
+                
+            try:
+                with camera_lock:
+                    if picam2 is None:
+                        continue
+                    frame = picam2.capture_array()
+                
+                if frame is not None and frame.size > 0:
+                    # 增加帧计数器
+                    frame_counter += 1
+                    
+                    # 处理帧 (使用优化后的处理函数)
+                    processed_frame = process_frame(frame)
+                    
+                    if processed_frame is not None:
+                        with frame_lock:
+                            latest_frame = processed_frame
+                            last_frame_time = current_time
+                            update_fps_stats(current_time)
+                    
+                    # 编码和缓存帧，在客户端需要时可以重用
+                    if frame_counter % 2 == 0:  # 每2帧缓存一次
+                        encode_and_cache_frame(processed_frame)
+                    
+                    last_successful_capture = current_time
+                
+                    # 动态调整跳帧
+                    with stats_lock:
+                        current_fps = fps_stats["current"]
+                        if current_fps < 15:  # 帧率太低，减少处理量
+                            skip_frames = 0  # 不跳帧
+                        elif current_fps > 25:  # 帧率足够，可以偶尔跳过一帧
+                            skip_frames = 1
+                
+            except Exception as e:
+                logger.error(f"捕获帧异常: {e}")
+                if current_time - last_successful_capture > 10:
+                    logger.warning("长时间无法捕获帧，重置摄像头")
+                    with camera_lock:
+                        reset_camera()
+                    last_successful_capture = current_time
+                time.sleep(0.1)
+                continue
+                
+        except Exception as e:
+            logger.error(f"帧捕获线程错误: {e}")
+            time.sleep(0.1)
+
+def encode_and_cache_frame(frame):
+    """将帧编码并缓存，供多个客户端使用"""
+    global encoded_frames_cache, frame_cache_index
+    
+    if frame is None:
+        return
+        
+    try:
+        # 维持原有的JPEG质量
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 80]
+        ret, buffer = cv2.imencode('.jpg', frame, encode_params)
+        
+        if ret:
+            with encoded_frames_cache_lock:
+                # 初始化缓存
+                if len(encoded_frames_cache) < frame_cache_size:
+                    encoded_frames_cache.append({"time": time.time(), "data": buffer})
+                else:
+                    # 更新缓存中最旧的帧
+                    encoded_frames_cache[frame_cache_index] = {"time": time.time(), "data": buffer}
+                    frame_cache_index = (frame_cache_index + 1) % frame_cache_size
+    except Exception as e:
+        logger.error(f"编码缓存帧出错: {e}")
+
+def get_cached_frame():
+    """获取缓存中最新的帧"""
+    with encoded_frames_cache_lock:
+        if not encoded_frames_cache:
+            return None
+            
+        # 找到最新的缓存帧
+        newest_index = 0
+        newest_time = 0
+        
+        for i, frame_data in enumerate(encoded_frames_cache):
+            if frame_data["time"] > newest_time:
+                newest_time = frame_data["time"]
+                newest_index = i
+                
+        return encoded_frames_cache[newest_index]["data"]
+
+def generate_frames():
+    """优化的帧生成器函数"""
+    global running, last_client_time, active_clients, latest_frame, last_frame_time
+    client_frame_time = time.time()
+    client_id = time.time()  # 生成唯一客户端ID
+    
+    # 控制每个客户端的帧率，不同客户端可以错开发送时间
+    target_interval = 1.0/20.0  # 目标20fps
+    
+    with clients_lock:
+        active_clients += 1
+        logger.info(f"客户端 {client_id:.2f} 连接，当前活跃客户端: {active_clients}")
+    
+    try:
+        while running:
+            current_time = time.time()
+            
+            # 帧率控制
+            if current_time - client_frame_time < target_interval:
+                time.sleep(0.001)  # 短暂睡眠以降低CPU使用
+                continue
+                
+            client_frame_time = current_time
+            
+            # 首先检查是否有可用的缓存帧
+            buffer = get_cached_frame()
+            
+            # 如果没有缓存帧，则实时编码一帧
+            if buffer is None:
+                with frame_lock:
+                    if latest_frame is None:
+                        time.sleep(0.01)
+                        continue
+                    
+                    frame = latest_frame.copy()
+                
+                # 编码
+                encode_params = [cv2.IMWRITE_JPEG_QUALITY, 80]
+                ret, buffer = cv2.imencode('.jpg', frame, encode_params)
+                if not ret:
+                    continue
+            
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            
+    except Exception as e:
+        logger.error(f"生成帧异常: {e}")
+    finally:
+        with clients_lock:
+            active_clients -= 1
+            logger.info(f"客户端 {client_id:.2f} 断开，当前活跃客户端: {active_clients}")
+
+@app.route('/')
+def index():
+    # 获取当前IP和服务URL
+    ip = get_ip_address()
+    service_url = f"http://{ip}:8000/video_feed"
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>摄像头流</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                text-align: center;
+                background-color: #f0f0f0;
+            }}
+            h1 {{
+                color: #333;
+            }}
+            .container {{
+                max-width: 800px;
+                margin: 0 auto;
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            img {{
+                max-width: 100%;
+                border-radius: 4px;
+            }}
+            .info {{
+                margin-top: 20px;
+                padding: 10px;
+                background: #e9f7fe;
+                border-radius: 4px;
+                text-align: left;
+            }}
+            .reload {{
+                display: inline-block;
+                margin-top: 10px;
+                padding: 8px 15px;
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+            }}
+            .reload:hover {{
+                background-color: #45a049;
+            }}
+        </style>
+        <script>
+            // 自动重连功能
+            function setupAutoReconnect() {{
+                const img = document.getElementById('stream');
+                let reconnectTimer = null;
+                let errorCounter = 0;
+                
+                img.onload = function() {{
+                    console.log('视频流已加载');
+                    errorCounter = 0;
+                }};
+                
+                img.onerror = function() {{
+                    errorCounter++;
+                    console.log(`视频流错误 (${{errorCounter}}次)`);
+                    
+                    if (errorCounter <= 5) {{
+                        if (reconnectTimer) clearTimeout(reconnectTimer);
+                        
+                        reconnectTimer = setTimeout(function() {{
+                            console.log('尝试重新加载视频流...');
+                            img.src = '/video_feed?t=' + new Date().getTime();
+                        }}, 2000);
+                    }} else {{
+                        console.log('多次重连失败，请手动刷新页面');
+                        document.getElementById('reconnect-msg').style.display = 'block';
+                    }}
+                }};
+            }}
+            
+            window.onload = function() {{
+                setupAutoReconnect();
+                
+                // 手动重新加载
+                document.getElementById('reload-btn').onclick = function() {{
+                    location.reload();
+                }};
+            }};
+        </script>
+    </head>
+    <body>
+        <div class="container">
+            <h1>树莓派摄像头流</h1>
+            <img id="stream" src="/video_feed" alt="摄像头流">
+            <div id="reconnect-msg" style="display: none; color: red; margin-top: 10px;">
+                视频流连接出现问题。
+                <button id="reload-btn" class="reload">刷新页面</button>
+            </div>
+            <div class="info">
+                <p><strong>服务器IP:</strong> {ip}</p>
+                <p><strong>视频流URL:</strong> {service_url}</p>
+                <p><strong>活跃连接:</strong> {active_clients}/{max_clients}</p>
+                <p>树莓派摄像头服务正在运行</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.route('/video_feed')
+def video_feed():
+    # 限制最大客户端数量
+    with clients_lock:
+        if active_clients >= max_clients:
+            return "达到最大连接数，请稍后再试", 503
+    
+    # 返回视频流
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/status')
+def status():
+    """返回服务器状态信息"""
+    with stats_lock:
+        status_data = {
+            "active_clients": active_clients,
+            "max_clients": max_clients,
+            "fps": fps_stats,
+            "uptime": time.time() - service_start_time,
+            "camera_status": "running" if picam2 is not None else "stopped",
+            "server_ip": get_ip_address(),
+            "reduce_processing": reduce_processing
+        }
+    return status_data
+
+@app.route('/reset_camera', methods=['POST'])
+def reset_camera_endpoint():
+    """手动重置摄像头的API端点"""
+    success = reset_camera()
+    if success:
+        return {"status": "success", "message": "摄像头已重置"}
+    else:
+        return {"status": "error", "message": "摄像头重置失败"}, 500
+
+@app.route('/debug')
+def debug_info():
+    """返回详细的调试信息页面"""
+    with stats_lock, clients_lock:
+        debug_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>摄像头调试信息</title>
+            <meta charset="utf-8">
+            <meta http-equiv="refresh" content="5">
+            <style>
+                body {{ font-family: monospace; padding: 20px; }}
+                .stat {{ margin-bottom: 5px; }}
+                .error {{ color: red; }}
+                .good {{ color: green; }}
+            </style>
+        </head>
+        <body>
+            <h1>摄像头服务调试信息</h1>
+            <div class="stat">摄像头状态: <span class="{'good' if picam2 is not None else 'error'}">{('运行中' if picam2 is not None else '未运行')}</span></div>
+            <div class="stat">服务运行时间: {int(time.time() - service_start_time)}秒</div>
+            <div class="stat">最后一帧时间: {int(time.time() - last_frame_time)}秒前</div>
+            <div class="stat">活跃客户端: {active_clients}/{max_clients}</div>
+            <div class="stat">当前FPS: <span class="{'error' if fps_stats['current'] < 5 else 'good'}">{fps_stats['current']:.2f}</span></div>
+            <div class="stat">最小FPS: {fps_stats['min']:.2f}</div>
+            <div class="stat">最大FPS: {fps_stats['max']:.2f}</div>
+            <div class="stat">处理模式: {'简化' if reduce_processing else '完整'}</div>
+            <div class="stat">服务器IP: {get_ip_address()}</div>
+            <div>
+                <h3>操作</h3>
+                <form action="/reset_camera" method="post">
+                    <button type="submit">重置摄像头</button>
+                </form>
+            </div>
+        </body>
+        </html>
+        """
+        return debug_html
+
+def health_check():
+    """定期检查摄像头状态和服务健康"""
+    global picam2, running, last_frame_time
+    last_check = time.time()
+    
+    while running:
+        current_time = time.time()
+        
+        # 每隔设定时间进行一次健康检查
+        if current_time - last_check >= health_check_interval:
+            logger.info("执行健康检查...")
+            
+            # 检查最后一帧的时间
+            if current_time - last_frame_time > frame_timeout:
+                logger.warning(f"帧超时 ({current_time - last_frame_time:.1f}秒没有新帧)，重置摄像头")
+                reset_camera()
+            
+            # 输出当前状态
+            with clients_lock, stats_lock:
+                logger.info(f"服务状态 - 活跃客户端: {active_clients}/{max_clients}, FPS: {fps_stats['current']:.2f}")
+            
+            last_check = current_time
+        
+        # 短暂休眠以减少CPU使用
+        time.sleep(1)
+
+if __name__ == '__main__':
+    # 记录启动时间
+    service_start_time = time.time()
+    ip_address = get_ip_address()
+    
+    try:
+        logger.info(f"摄像头服务器开始启动，IP: {ip_address}")
+        
+        # 在一个新线程中初始化摄像头
+        init_thread = threading.Thread(target=init_camera)
+        init_thread.daemon = True
+        init_thread.start()
+        init_thread.join()  # 等待摄像头初始化完成
+        
+        # 启动后台帧捕获线程
+        capture_thread = threading.Thread(target=capture_continuous)
+        capture_thread.daemon = True
+        capture_thread.start()
+        
+        # 启动健康检查线程
+        health_thread = threading.Thread(target=health_check)
+        health_thread.daemon = True
+        health_thread.start()
+        
+        # 启动Flask应用
+        logger.info(f"摄像头服务器开始运行在 http://{ip_address}:8000")
+        app.run(host='0.0.0.0', port=8000, threaded=True, use_reloader=False)
+        
+    except KeyboardInterrupt:
+        logger.info("接收到终止信号，关闭服务...")
+    except Exception as e:
+        logger.error(f"服务器运行出错: {e}")
+    finally:
+        running = False
+        if picam2 is not None:
+            try:
+                picam2.stop()
+            except:
+                pass
+        logger.info("摄像头服务已关闭")
