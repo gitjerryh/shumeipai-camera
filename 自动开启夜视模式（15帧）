@@ -1,0 +1,1080 @@
+from flask import Flask, Response, request
+from picamera2 import Picamera2
+import cv2
+import time
+import threading
+import numpy as np
+import os
+import signal
+import sys
+import logging
+import socket
+import subprocess
+
+# 使用当前用户的主目录
+home_dir = os.path.expanduser("~")
+log_file = os.path.join(home_dir, "camera_server.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(log_file)
+    ]
+)
+logger = logging.getLogger('camera_server')
+
+app = Flask(__name__)
+picam2 = None
+camera_lock = threading.Lock()
+running = True
+last_client_time = time.time()
+active_clients = 0
+max_clients = 5
+clients_lock = threading.Lock()
+health_check_interval = 30
+
+# 添加帧超时检测变量
+last_frame_time = 0
+frame_timeout = 5  # 5秒没有新帧就重启摄像头
+
+# 监控摄像头性能的变量
+frame_times = []  # 用于FPS计算的帧时间列表
+fps_stats = {"current": 0, "min": 0, "max": 0, "avg": 0}
+stats_lock = threading.Lock()
+latest_frame = None  # 存储最新的帧
+frame_lock = threading.Lock()  # 用于保护latest_frame
+
+# 用于控制图像处理复杂度的标志
+reduce_processing = False  # 默认使用完整处理
+frame_counter = 0
+
+# 添加预处理的查找表，以加速颜色调整
+b_lut = np.clip(np.arange(0, 256) * 0.85, 0, 255).astype(np.uint8)  # 降低蓝色通道但更轻微
+# 略微提高红色通道增益以改善颜色平衡但不过度
+r_lut = np.clip(np.arange(0, 256) * 1.05, 0, 255).astype(np.uint8)  # 轻微增强红色通道
+# 调整亮度和对比度以提高细节可见性但保持稳定
+alpha_beta_lut = np.clip(np.arange(0, 256) * 1.05 + 5, 0, 255).astype(np.uint8)
+
+# 将已编码的帧缓存
+encoded_frames_cache = []
+encoded_frames_cache_lock = threading.Lock()
+frame_cache_size = 3
+frame_cache_index = 0
+
+# 添加时间戳缓存变量
+last_timestamp = ""
+last_timestamp_update = 0
+timestamp_update_interval = 1.0  # 时间戳每秒更新一次，但每帧都显示
+
+# 帧间平滑过渡变量
+previous_frame = None
+transition_alpha = 0.8  # 增加当前帧权重，减少前一帧权重以提高响应速度
+use_frame_blending = True  # 可以动态控制是否使用帧混合
+
+# 创建一个固定的锐化核，避免每次重新计算
+sharpening_kernel = np.array([[-0.1, -0.1, -0.1],
+                              [-0.1,  1.8, -0.1],
+                              [-0.1, -0.1, -0.1]])
+
+# 红外夜视相关变量
+night_vision_enabled = True   # 是否启用夜视模式（默认开启）
+night_vision_auto = True      # 是否自动切换夜视模式
+night_vision_active = False   # 夜视模式是否激活
+light_threshold = 50.0        # 光线阈值，低于此值启用夜视
+last_light_level = 255.0      # 上次检测到的光线水平
+ir_led_available = False      # 是否有可控制的红外LED
+ir_led_pin = 17               # 红外LED的GPIO引脚
+night_vision_lock = threading.Lock()  # 夜视模式的锁
+night_vision_strength = 0.8   # 夜视增强强度
+enable_green_tint = True      # 是否启用绿色夜视效果
+
+# 创建夜视模式查找表
+# 提高暗部和中间亮度区域，使暗处细节更加可见
+night_mode_lut = np.clip(np.power(np.arange(0, 256) / 255.0, 0.6) * 255 + 30, 0, 255).astype(np.uint8)
+
+def signal_handler(sig, frame):
+    global running
+    logger.info("正在关闭摄像头服务...")
+    running = False
+    if picam2 is not None:
+        try:
+            picam2.stop()
+        except Exception as e:
+            logger.error(f"关闭摄像头时出错: {e}")
+    sys.exit(0)
+
+# 注册信号处理器
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+def get_ip_address():
+    try:
+        # 获取本机IP地址(非回环地址)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception as e:
+        logger.error(f"获取IP地址失败: {e}")
+        return "127.0.0.1"
+
+def reset_camera():
+    """重置摄像头，在出现问题时调用"""
+    global picam2
+    logger.warning("正在重置摄像头...")
+    
+    with camera_lock:
+        if picam2 is not None:
+            try:
+                picam2.stop()
+                logger.info("摄像头已停止")
+            except Exception as e:
+                logger.error(f"停止摄像头时出错: {e}")
+            finally:
+                picam2 = None
+    
+    # 等待一段时间再重新初始化
+    time.sleep(2)
+    return init_camera()
+
+def init_camera():
+    global picam2, last_frame_time
+    try:
+        if picam2 is not None:
+            try:
+                picam2.stop()
+            except:
+                pass
+            picam2 = None
+            
+        attempts = 0
+        logger.info("初始化摄像头...")
+        
+        for attempt in range(3):  # 尝试3次
+            try:
+                picam2 = Picamera2()
+                
+                # 优化摄像头参数以提高图像质量，同时降低闪烁问题
+                config = picam2.create_video_configuration(
+                    main={
+                        "size": (640, 480),
+                        "format": "RGB888"
+                    },
+                    buffer_count=4,  # 增加缓冲区数量
+                    controls={
+                        "FrameDurationLimits": (33333, 33333),  # 约30fps
+                        "AwbEnable": True,      # 保持自动白平衡
+                        "AwbMode": 1,           # 使用日光模式
+                        "Brightness": 0.08,     # 轻微提高亮度但不过度
+                        "Contrast": 1.02,       # 轻微提高对比度但减少过度调整
+                        "Saturation": 1.1,      # 适度提高饱和度
+                        "Sharpness": 1.0,       # 使用默认锐度，通过软件处理
+                        "ExposureValue": 0.0,   # 使用默认曝光值，减少波动
+                        "ColourGains": (1.3, 1.2),  # 更温和的红绿增益
+                        "NoiseReductionMode": 2,  # 提高降噪强度
+                        "FrameRate": 30.0      # 固定帧率
+                    }
+                )
+                
+                # 初始化夜视模式设置
+                global night_vision_enabled, night_vision_auto
+                try:
+                    # 重置夜视相关变量
+                    night_vision_enabled = True  # 默认启用夜视功能
+                    night_vision_auto = True     # 默认为自动模式
+                    logger.info("夜视功能已初始化")
+                except Exception as e:
+                    logger.warning(f"初始化夜视功能时出错: {e}")
+                
+                picam2.configure(config)
+                time.sleep(0.5)
+                
+                picam2.start()
+                logger.info(f"摄像头初始化成功 (尝试 {attempt+1}/3)")
+                
+                # 丢弃前几帧
+                for _ in range(5):
+                    picam2.capture_array()
+                    time.sleep(0.03)
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"摄像头初始化尝试 {attempt+1}/3 失败: {e}")
+                if picam2 is not None:
+                    try:
+                        picam2.stop()
+                    except:
+                        pass
+                    picam2 = None
+                time.sleep(2)
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"初始化摄像头过程中发生错误: {e}")
+        return False
+
+def adjust_colors_fast(frame):
+    """使用查找表快速调整颜色"""
+    try:
+        if frame is None or frame.size == 0:
+            return None
+            
+        # 使用OpenCV的split/LUT/merge操作，这些操作经过高度优化
+        b, g, r = cv2.split(frame)
+        b = cv2.LUT(b, b_lut)
+        r = cv2.LUT(r, r_lut)
+        
+        # 使用优化的合并操作
+        adjusted = cv2.merge([b, g, r])
+        
+        # 使用查找表进行亮度和对比度调整，避免逐像素计算
+        adjusted = cv2.LUT(adjusted, alpha_beta_lut)
+        
+        return adjusted
+    except Exception as e:
+        logger.error(f"快速颜色调整出错: {e}")
+        return frame
+
+def apply_sharpening(frame):
+    """应用预计算的锐化核以提高速度"""
+    try:
+        if frame is None:
+            return frame
+            
+        # 直接使用预计算的锐化核，避免每次重新创建
+        sharpened = cv2.filter2D(frame, -1, sharpening_kernel)
+        
+        # 使用加权混合但减少计算复杂度
+        result = cv2.addWeighted(frame, 0.7, sharpened, 0.3, 0)
+        
+        return result
+    except Exception as e:
+        logger.error(f"锐化处理出错: {e}")
+        return frame
+
+def detect_low_light(frame):
+    """优化的低光检测算法"""
+    global last_light_level, light_threshold
+    
+    try:
+        if frame is None or frame.size == 0:
+            return False
+            
+        # 降低分辨率以加快处理速度
+        small_frame = cv2.resize(frame, (80, 60))
+        
+        # 转为灰度图
+        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+        
+        # 使用直方图计算暗区像素占比
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+        total_pixels = small_frame.shape[0] * small_frame.shape[1]
+        dark_pixels = np.sum(hist[:50])  # 统计暗区像素（小于50亮度）
+        dark_ratio = dark_pixels / total_pixels
+        
+        # 计算平均亮度
+        avg_brightness = np.mean(gray)
+        
+        # 综合考虑暗区占比和平均亮度
+        light_level = avg_brightness * (1.0 - dark_ratio * 0.5)
+        
+        # 平滑过渡，避免频繁切换
+        last_light_level = last_light_level * 0.8 + light_level * 0.2
+        
+        # 判断是否处于低光环境
+        is_low_light = last_light_level < light_threshold
+        
+        # 调试输出
+        if frame_counter % 30 == 0:  # 每30帧记录一次
+            logger.info(f"光线水平: {last_light_level:.1f}, 阈值: {light_threshold}, 低光状态: {is_low_light}")
+        
+        return is_low_light
+        
+    except Exception as e:
+        logger.error(f"光线检测错误: {e}")
+        return False
+
+def apply_night_vision(frame):
+    """应用夜视模式增强处理"""
+    global night_mode_lut, night_vision_strength, enable_green_tint
+    
+    try:
+        if frame is None:
+            return frame
+            
+        # 1. 应用亮度增强查找表
+        enhanced = cv2.LUT(frame, night_mode_lut)
+        
+        # 2. 转换为HSV空间调整饱和度和亮度
+        hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        
+        # 降低饱和度
+        s = cv2.multiply(s, 0.3)
+        
+        # 增加明亮度以改善暗区可见性
+        v = cv2.add(v, 30)
+        v = np.clip(v, 0, 255).astype(np.uint8)
+        
+        # 3. 可选：应用绿色色调（传统夜视效果）
+        if enable_green_tint:
+            # 将色调转为绿色 (60度左右)
+            h = np.ones_like(h) * 60
+            # 提高绿色区域的饱和度
+            s = cv2.multiply(s, 0.8)
+        
+        merged = cv2.merge([h, s, v])
+        night_vision_frame = cv2.cvtColor(merged, cv2.COLOR_HSV2BGR)
+        
+        # 4. 应用降噪来减少噪点（采用较小的滤波半径减少性能影响）
+        night_vision_frame = cv2.GaussianBlur(night_vision_frame, (3, 3), 0)
+        
+        # 5. 应用锐化增强细节（使用较小的核以减少性能影响）
+        kernel = np.array([[-0.1, -0.1, -0.1],
+                           [-0.1, 2.0, -0.1],
+                           [-0.1, -0.1, -0.1]])
+        night_vision_frame = cv2.filter2D(night_vision_frame, -1, kernel)
+        
+        return night_vision_frame
+    except Exception as e:
+        logger.error(f"夜视模式处理出错: {e}")
+        return frame
+
+def check_and_update_night_vision(frame):
+    """检查是否需要启用或关闭夜视模式"""
+    global night_vision_enabled, night_vision_auto, night_vision_active
+    
+    # 如果夜视功能未启用，直接返回
+    if not night_vision_enabled:
+        if night_vision_active:
+            # 如果之前是激活状态，现在要关闭
+            with night_vision_lock:
+                night_vision_active = False
+                logger.info("夜视模式已关闭")
+        return
+    
+    # 如果设置为自动模式，检测光线水平
+    if night_vision_auto:
+        low_light = detect_low_light(frame)
+        
+        with night_vision_lock:
+            if low_light and not night_vision_active:
+                # 光线不足，开启夜视模式
+                night_vision_active = True
+                logger.info("检测到光线不足，自动开启夜视模式")
+            elif not low_light and night_vision_active:
+                # 光线充足，关闭夜视模式
+                night_vision_active = False
+                logger.info("检测到光线充足，自动关闭夜视模式")
+    else:
+        # 非自动模式，强制启用夜视
+        with night_vision_lock:
+            if not night_vision_active:
+                night_vision_active = True
+
+def enhance_frame(frame):
+    """优化的帧增强函数，减少计算开销"""
+    global previous_frame, transition_alpha, use_frame_blending, night_vision_active
+    
+    if frame is None or frame.size == 0:
+        return None
+    
+    try:
+        # 检查并更新夜视模式状态
+        check_and_update_night_vision(frame)
+        
+        # 根据夜视模式选择图像处理流程
+        if night_vision_active:
+            # 应用夜视增强处理
+            adjusted = apply_night_vision(frame)
+        else:
+            # 使用标准的颜色调整函数
+            adjusted = adjust_colors_fast(frame)
+        
+        # 根据处理模式选择性应用处理
+        if not reduce_processing:
+            # 每隔3帧应用一次锐化，减少计算负担
+            global frame_counter
+            if frame_counter % 3 == 0 and not night_vision_active:
+                # 夜视模式下已经应用了锐化，这里不需要重复
+                adjusted = apply_sharpening(adjusted)
+            frame_counter += 1
+            
+            # 仅在画面变化大且非高负载时应用帧间平滑
+            if use_frame_blending and previous_frame is not None and previous_frame.shape == adjusted.shape:
+                adjusted = cv2.addWeighted(adjusted, transition_alpha, 
+                                        previous_frame, 1.0-transition_alpha, 0)
+        
+        # 更新前一帧但不使用深复制以提高性能
+        if use_frame_blending:
+            previous_frame = adjusted
+            
+        return adjusted
+    except Exception as e:
+        logger.error(f"帧增强错误: {e}")
+        return frame  # 如果处理失败，返回原始帧
+
+def update_fps_stats(frame_time):
+    """计算并更新FPS统计信息"""
+    global fps_stats, frame_times
+    with stats_lock:
+        # 保留最近10帧的时间，减少计算量
+        frame_times.append(frame_time)
+        if len(frame_times) > 10:
+            frame_times.pop(0)
+            
+        # 计算FPS
+        if len(frame_times) > 1:
+            # 使用简单的FPS计算方法
+            elapsed = frame_times[-1] - frame_times[0]
+            if elapsed > 0:
+                fps = (len(frame_times) - 1) / elapsed
+                
+                fps_stats["current"] = fps
+                if fps_stats["min"] == 0 or fps < fps_stats["min"]:
+                    fps_stats["min"] = fps
+                if fps > fps_stats["max"]:
+                    fps_stats["max"] = fps
+                # 使用简单平均
+                fps_stats["avg"] = fps
+
+def process_frame(frame):
+    """简化的帧处理函数，解决闪烁问题"""
+    try:
+        if frame is None or frame.size == 0:
+            return None
+            
+        # 检查帧的形状和格式
+        if len(frame.shape) != 3:
+            logger.error(f"帧格式错误: 形状 {frame.shape}")
+            return None
+            
+        # 简单的亮度和对比度增强，保持一致性
+        frame = enhance_frame(frame)
+        
+        # 添加时间戳和FPS信息
+        current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        
+        # 获取当前FPS
+        with stats_lock:
+            current_fps = fps_stats["current"]
+        fps_text = f"FPS: {current_fps:.1f}"
+        
+        # 添加时间戳
+        text_size = cv2.getTextSize(current_time, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+        cv2.rectangle(frame, (10, 10), (10 + text_size[0], 10 + text_size[1] + 5), (0, 0, 0), -1)
+        cv2.putText(frame, current_time, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # 添加FPS信息
+        fps_text_size = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+        cv2.rectangle(frame, (10, 35), (10 + fps_text_size[0], 35 + fps_text_size[1] + 5), (0, 0, 0), -1)
+        cv2.putText(frame, fps_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        return frame
+    except Exception as e:
+        logger.error(f"处理帧出错: {e}")
+        return None
+
+def is_valid_frame(frame):
+    """快速帧验证，减少处理时间提高帧率"""
+    if frame is None or frame.size == 0:
+        return False
+    
+    try:
+        # 仅执行基本检查，减少处理时间
+        # 检查帧形状
+        if len(frame.shape) != 3:
+            return False
+        
+        # 只检查图像部分区域以加速处理
+        # 从中心取样本区域
+        h, w = frame.shape[:2]
+        center_y, center_x = h // 2, w // 2
+        sample_size = 50  # 采样区域大小
+        
+        sample = frame[
+            max(0, center_y - sample_size):min(h, center_y + sample_size),
+            max(0, center_x - sample_size):min(w, center_x + sample_size)
+        ]
+        
+        # 快速检查样本区域
+        avg_value = np.mean(sample)
+        if avg_value < 5:  # 几乎全黑
+            return False
+            
+        # 快速检查颜色分布
+        std_value = np.std(sample)
+        if std_value < 3:  # 几乎单色
+            return False
+            
+        return True
+    except Exception as e:
+        logger.error(f"帧验证错误: {e}")
+        return False
+
+def capture_continuous():
+    """优化的帧捕获函数，专注于提高帧率和稳定性"""
+    global picam2, running, latest_frame, last_frame_time, frame_counter
+    
+    logger.info("开始后台帧捕获线程")
+    
+    # 记录性能数据
+    frame_times = []
+    
+    while running:
+        try:
+            if picam2 is None:
+                if not init_camera():
+                    time.sleep(1)
+                    continue
+            
+            # 开始计时
+            frame_start_time = time.time()
+            
+            try:
+                # 尽量减少锁的持有时间
+                with camera_lock:
+                    if picam2 is None:
+                        continue
+                    frame = picam2.capture_array()
+                
+                if frame is not None and frame.size > 0:
+                    frame_counter += 1
+                    
+                    # 每一帧都做相同处理，保持一致性
+                    processed_frame = process_frame(frame)
+                    
+                    if processed_frame is not None:
+                        # 更新帧数据
+                        with frame_lock:
+                            latest_frame = processed_frame
+                            last_frame_time = time.time()
+                            update_fps_stats(time.time())
+                        
+                        # 编码缓存
+                        encode_and_cache_frame(processed_frame)
+                        
+                        # 记录帧处理时间
+                        frame_times.append(time.time() - frame_start_time)
+                        if len(frame_times) > 30:
+                            # 每30帧记录一次平均处理时间
+                            avg_time = sum(frame_times) / len(frame_times)
+                            logger.debug(f"平均帧处理时间: {avg_time*1000:.1f}ms，约等于 {1/avg_time:.1f}fps")
+                            frame_times = []
+                    
+                    # 动态休眠控制帧率
+                    elapsed = time.time() - frame_start_time
+                    if elapsed < 0.03:  # 目标30+fps
+                        # 非常短的休眠以节省CPU，同时保持高帧率
+                        time.sleep(0.001)
+                
+            except Exception as e:
+                logger.error(f"捕获帧异常: {e}")
+                time.sleep(0.1)
+                
+        except Exception as e:
+            logger.error(f"帧捕获线程错误: {e}")
+            time.sleep(0.1)
+
+def encode_and_cache_frame(frame):
+    """编码并缓存当前帧为JPEG格式"""
+    global encoded_frames_cache
+    
+    if frame is None:
+        logger.warning("无法编码空帧")
+        return
+    
+    try:
+        # 确保清晰的图像质量，但避免过大
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        
+        with encoded_frames_cache_lock:
+            # 单帧缓存，确保最新
+            encoded_frames_cache = [{"time": time.time(), "data": buffer.tobytes()}]
+    except Exception as e:
+        logger.error(f"编码帧出错: {e}")
+
+def get_cached_frame():
+    """获取最新的缓存帧"""
+    global encoded_frames_cache
+    
+    with encoded_frames_cache_lock:
+        if not encoded_frames_cache:
+            return b''
+        return encoded_frames_cache[0]["data"]
+
+def generate_frames():
+    """优化的帧生成器，提高帧率和减少闪烁"""
+    global running, active_clients
+    client_id = time.time()
+    target_interval = 1.0 / 30.0  # 目标30fps
+    
+    with clients_lock:
+        active_clients += 1
+        logger.info(f"客户端 {client_id:.2f} 连接，当前活跃客户端: {active_clients}")
+    
+    try:
+        last_frame_time = time.time()
+        while running:
+            try:
+                # 保持固定间隔发送帧
+                now = time.time()
+                time_to_wait = target_interval - (now - last_frame_time)
+                
+                if time_to_wait > 0:
+                    # 使用极短的休眠
+                    time.sleep(0.001)
+                    continue
+                
+                # 重置时间
+                last_frame_time = now
+                
+                # 获取缓存帧
+                buffer = get_cached_frame()
+                if buffer is None:
+                    continue
+                
+                # 发送帧数据
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + buffer + b'\r\n')
+                
+            except Exception as e:
+                logger.error(f"生成帧异常: {e}")
+                time.sleep(0.03)
+                
+    except Exception as e:
+        logger.error(f"生成帧异常: {e}")
+    finally:
+        with clients_lock:
+            active_clients -= 1
+            logger.info(f"客户端 {client_id:.2f} 断开，当前活跃客户端: {active_clients}")
+
+@app.route('/')
+def index():
+    # 获取当前IP和服务URL
+    ip = get_ip_address()
+    service_url = f"http://{ip}:8000/video_feed"
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>摄像头流</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                text-align: center;
+                background-color: #f0f0f0;
+            }}
+            h1 {{
+                color: #333;
+            }}
+            .container {{
+                max-width: 800px;
+                margin: 0 auto;
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            img {{
+                max-width: 100%;
+                border-radius: 4px;
+            }}
+            .info {{
+                margin-top: 20px;
+                padding: 10px;
+                background: #e9f7fe;
+                border-radius: 4px;
+                text-align: left;
+            }}
+            .reload {{
+                display: inline-block;
+                margin-top: 10px;
+                padding: 8px 15px;
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+            }}
+            .reload:hover {{
+                background-color: #45a049;
+            }}
+        </style>
+        <script>
+            // 自动重连功能
+            function setupAutoReconnect() {{
+                const img = document.getElementById('stream');
+                let reconnectTimer = null;
+                let errorCounter = 0;
+                
+                img.onload = function() {{
+                    console.log('视频流已加载');
+                    errorCounter = 0;
+                }};
+                
+                img.onerror = function() {{
+                    errorCounter++;
+                    console.log(`视频流错误 (${{errorCounter}}次)`);
+                    
+                    if (errorCounter <= 5) {{
+                        if (reconnectTimer) clearTimeout(reconnectTimer);
+                        
+                        reconnectTimer = setTimeout(function() {{
+                            console.log('尝试重新加载视频流...');
+                            img.src = '/video_feed?t=' + new Date().getTime();
+                        }}, 2000);
+                    }} else {{
+                        console.log('多次重连失败，请手动刷新页面');
+                        document.getElementById('reconnect-msg').style.display = 'block';
+                    }}
+                }};
+            }}
+            
+            window.onload = function() {{
+                setupAutoReconnect();
+                
+                // 手动重新加载
+                document.getElementById('reload-btn').onclick = function() {{
+                    location.reload();
+                }};
+            }};
+        </script>
+    </head>
+    <body>
+        <div class="container">
+            <h1>树莓派摄像头流</h1>
+            <img id="stream" src="/video_feed" alt="摄像头流">
+            <div id="reconnect-msg" style="display: none; color: red; margin-top: 10px;">
+                视频流连接出现问题。
+                <button id="reload-btn" class="reload">刷新页面</button>
+            </div>
+            <div class="info">
+                <p><strong>服务器IP:</strong> {ip}</p>
+                <p><strong>视频流URL:</strong> {service_url}</p>
+                <p><strong>活跃连接:</strong> {active_clients}/{max_clients}</p>
+                <p>树莓派摄像头服务正在运行</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.route('/video_feed')
+def video_feed():
+    # 限制最大客户端数量
+    with clients_lock:
+        if active_clients >= max_clients:
+            return "达到最大连接数，请稍后再试", 503
+    
+    # 返回视频流
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/status')
+def status():
+    """返回服务器状态信息"""
+    with stats_lock:
+        status_data = {
+            "active_clients": active_clients,
+            "max_clients": max_clients,
+            "fps": fps_stats,
+            "uptime": time.time() - service_start_time,
+            "camera_status": "running" if picam2 is not None else "stopped",
+            "server_ip": get_ip_address(),
+            "reduce_processing": reduce_processing
+        }
+    return status_data
+
+@app.route('/reset_camera', methods=['POST'])
+def reset_camera_endpoint():
+    """手动重置摄像头的API端点"""
+    success = reset_camera()
+    if success:
+        return {"status": "success", "message": "摄像头已重置"}
+    else:
+        return {"status": "error", "message": "摄像头重置失败"}, 500
+
+@app.route('/restart_service', methods=['POST'])
+def restart_service_endpoint():
+    """重启整个视频流服务的API端点"""
+    try:
+        logger.info("收到重启服务请求，准备重启服务...")
+        # 这里我们创建一个独立进程来重启服务，这样当前进程可以正常返回响应
+        subprocess.Popen(['sudo', 'systemctl', 'restart', 'camera-service'], 
+                          stdout=subprocess.PIPE, 
+                          stderr=subprocess.PIPE)
+        return {"status": "success", "message": "重启服务请求已发送，服务即将重启"}
+    except Exception as e:
+        logger.error(f"重启服务失败: {e}")
+        return {"status": "error", "message": f"重启服务失败: {e}"}, 500
+
+@app.route('/debug')
+def debug_info():
+    """返回详细的调试信息页面"""
+    with stats_lock, clients_lock, night_vision_lock:
+        debug_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>摄像头调试信息</title>
+            <meta charset="utf-8">
+            <meta http-equiv="refresh" content="5">
+            <style>
+                body {{ font-family: monospace; padding: 20px; }}
+                .stat {{ margin-bottom: 5px; }}
+                .error {{ color: red; }}
+                .good {{ color: green; }}
+            </style>
+        </head>
+        <body>
+            <h1>摄像头服务调试信息</h1>
+            <div class="stat">摄像头状态: <span class="{'good' if picam2 is not None else 'error'}">{('运行中' if picam2 is not None else '未运行')}</span></div>
+            <div class="stat">服务运行时间: {int(time.time() - service_start_time)}秒</div>
+            <div class="stat">最后一帧时间: {int(time.time() - last_frame_time)}秒前</div>
+            <div class="stat">活跃客户端: {active_clients}/{max_clients}</div>
+            <div class="stat">当前FPS: <span class="{'error' if fps_stats['current'] < 5 else 'good'}">{fps_stats['current']:.2f}</span></div>
+            <div class="stat">最小FPS: {fps_stats['min']:.2f}</div>
+            <div class="stat">最大FPS: {fps_stats['max']:.2f}</div>
+            <div class="stat">处理模式: {'简化' if reduce_processing else '完整'}</div>
+            <div class="stat">服务器IP: {get_ip_address()}</div>
+            <div>
+                <h3>操作</h3>
+                <form action="/reset_camera" method="post">
+                    <button type="submit">重置摄像头</button>
+                </form>
+            </div>
+            <div class="section">
+                <h2>夜视模式状态</h2>
+                <div class="stat">夜视功能: <span class="{'good' if night_vision_enabled else 'error'}">{('已启用' if night_vision_enabled else '未启用')}</span></div>
+                <div class="stat">夜视模式: <span class="{('good' if night_vision_auto else '')}">{('自动' if night_vision_auto else '手动')}</span></div>
+                <div class="stat">当前状态: <span class="{'good' if night_vision_active else ''}">{('活跃' if night_vision_active else '未活跃')}</span></div>
+                <div class="stat">当前光线水平: <span>{last_light_level:.1f}</span></div>
+                <div class="stat">光线阈值: <span>{light_threshold}</span></div>
+                <div class="stat">夜视强度: <span>{night_vision_strength * 100:.0f}%</span></div>
+                <div class="stat">绿色夜视效果: <span>{('开启' if enable_green_tint else '关闭')}</span></div>
+            </div>
+            
+            <div class="section">
+                <h2>操作</h2>
+                <form action="/toggle_night_vision" method="post">
+                    <button type="submit">切换夜视功能</button>
+                </form>
+                <form action="/toggle_night_vision_mode" method="post">
+                    <button type="submit">切换夜视模式</button>
+                </form>
+                <form action="/set_night_vision_strength" method="post">
+                    <label for="strength">夜视增强强度 (0.1-1.0):</label>
+                    <input type="number" id="strength" name="strength" min="0.1" max="1.0" step="0.01" value="{night_vision_strength:.1f}">
+                    <button type="submit">设置夜视增强强度</button>
+                </form>
+                <form action="/toggle_green_night_vision" method="post">
+                    <button type="submit">切换绿色夜视效果</button>
+                </form>
+                <form action="/set_light_threshold" method="post">
+                    <label for="threshold">光线阈值 (10-150):</label>
+                    <input type="number" id="threshold" name="threshold" min="10" max="150" value="{light_threshold:.0f}">
+                    <button type="submit">设置光线阈值</button>
+                </form>
+            </div>
+        </body>
+        </html>
+        """
+        return debug_html
+
+def health_check():
+    """健康检查函数，监控和维护系统状态"""
+    global picam2, running, last_frame_time
+    last_check = time.time()
+    
+    while running:
+        current_time = time.time()
+        
+        # 每隔设定时间进行一次健康检查
+        if current_time - last_check >= health_check_interval:
+            logger.info("执行健康检查...")
+            
+            # 检查最后一帧的时间
+            if current_time - last_frame_time > frame_timeout:
+                logger.warning(f"帧超时 ({current_time - last_frame_time:.1f}秒没有新帧)，重置摄像头")
+                reset_camera()
+            
+            # 输出当前状态
+            with clients_lock, stats_lock:
+                logger.info(f"服务状态 - 活跃客户端: {active_clients}/{max_clients}, FPS: {fps_stats['current']:.2f}")
+            
+            last_check = current_time
+        
+        # 短暂休眠以减少CPU使用
+        time.sleep(1)
+
+# 在处理大量连接时动态调整性能
+def adjust_performance():
+    """根据连接数量和帧率动态调整性能"""
+    global running, active_clients, reduce_processing, use_frame_blending
+    
+    while running:
+        try:
+            with clients_lock:
+                client_count = active_clients
+            
+            # 获取当前帧率
+            with stats_lock:
+                current_fps = fps_stats["current"]
+                
+            # 根据客户端数量和帧率调整处理策略
+            if client_count > 3 or current_fps < 20:
+                # 大量客户端或帧率低时减少处理，保持基本帧率
+                reduce_processing = True
+                use_frame_blending = False
+            else:
+                # 少量客户端且帧率正常时启用适当处理
+                reduce_processing = False
+                use_frame_blending = True
+                
+        except Exception as e:
+            logger.error(f"性能调整错误: {e}")
+        
+        time.sleep(3)  # 减少性能监控的频率
+
+# 增加主线程服务启动
+if __name__ == '__main__':
+    # 记录启动时间
+    service_start_time = time.time()
+    ip_address = get_ip_address()
+    
+    try:
+        logger.info(f"摄像头服务器开始启动，IP: {ip_address}")
+        
+        # 初始化摄像头
+        if not init_camera():
+            logger.error("摄像头初始化失败，服务无法启动")
+            sys.exit(1)
+        
+        # 启动帧捕获线程
+        capture_thread = threading.Thread(target=capture_continuous)
+        capture_thread.daemon = True
+        capture_thread.start()
+        
+        # 启动健康检查线程
+        health_thread = threading.Thread(target=health_check)
+        health_thread.daemon = True
+        health_thread.start()
+        
+        # 启动Flask应用
+        logger.info(f"摄像头服务器开始运行在 http://{ip_address}:8000")
+        app.run(host='0.0.0.0', port=8000, threaded=True, use_reloader=False)
+        
+    except KeyboardInterrupt:
+        logger.info("接收到终止信号，关闭服务...")
+    except Exception as e:
+        logger.error(f"服务器运行出错: {e}")
+    finally:
+        running = False
+        if picam2 is not None:
+            try:
+                picam2.stop()
+            except:
+                pass
+        logger.info("摄像头服务已关闭")
+
+@app.route('/toggle_night_vision', methods=['POST'])
+def toggle_night_vision_endpoint():
+    """切换夜视功能开关的API端点"""
+    global night_vision_enabled
+    
+    try:
+        with night_vision_lock:
+            night_vision_enabled = not night_vision_enabled
+            status = '开启' if night_vision_enabled else '关闭'
+            logger.info(f"夜视功能已{status}")
+        return {"status": "success", "enabled": night_vision_enabled, "message": f"夜视功能已{status}"}
+    except Exception as e:
+        logger.error(f"切换夜视功能失败: {e}")
+        return {"status": "error", "message": f"切换夜视功能失败: {e}"}, 500
+
+@app.route('/toggle_night_vision_mode', methods=['POST'])
+def toggle_night_vision_mode_endpoint():
+    """切换夜视模式(自动/手动)的API端点"""
+    global night_vision_auto
+    
+    try:
+        with night_vision_lock:
+            night_vision_auto = not night_vision_auto
+            mode = '自动' if night_vision_auto else '手动'
+            logger.info(f"夜视模式已切换为{mode}模式")
+        return {"status": "success", "auto": night_vision_auto, "message": f"夜视模式已切换为{mode}模式"}
+    except Exception as e:
+        logger.error(f"切换夜视模式失败: {e}")
+        return {"status": "error", "message": f"切换夜视模式失败: {e}"}, 500
+
+@app.route('/set_night_vision_strength', methods=['POST'])
+def set_night_vision_strength_endpoint():
+    """设置夜视增强强度的API端点"""
+    global night_vision_strength
+    
+    try:
+        data = request.get_json()
+        if not data or 'strength' not in data:
+            return {"status": "error", "message": "缺少强度参数"}, 400
+            
+        strength = float(data['strength'])
+        if strength < 0.1 or strength > 1.0:
+            return {"status": "error", "message": "强度必须在0.1到1.0之间"}, 400
+            
+        with night_vision_lock:
+            night_vision_strength = strength
+            logger.info(f"夜视增强强度已设置为: {strength}")
+            
+        return {"status": "success", "strength": strength, "message": f"夜视增强强度已设置为: {strength:.1f}"}
+    except Exception as e:
+        logger.error(f"设置夜视增强强度失败: {e}")
+        return {"status": "error", "message": f"设置夜视增强强度失败: {e}"}, 500
+
+@app.route('/toggle_green_night_vision', methods=['POST'])
+def toggle_green_night_vision_endpoint():
+    """切换绿色夜视效果的API端点"""
+    global enable_green_tint
+    
+    try:
+        with night_vision_lock:
+            enable_green_tint = not enable_green_tint
+            status = '开启' if enable_green_tint else '关闭'
+            logger.info(f"绿色夜视效果已{status}")
+        return {"status": "success", "enabled": enable_green_tint, "message": f"绿色夜视效果已{status}"}
+    except Exception as e:
+        logger.error(f"切换绿色夜视效果失败: {e}")
+        return {"status": "error", "message": f"切换绿色夜视效果失败: {e}"}, 500
+
+@app.route('/set_light_threshold', methods=['POST'])
+def set_light_threshold_endpoint():
+    """设置光线阈值的API端点"""
+    global light_threshold
+    
+    try:
+        data = request.get_json()
+        if not data or 'threshold' not in data:
+            return {"status": "error", "message": "缺少阈值参数"}, 400
+            
+        threshold = float(data['threshold'])
+        if threshold < 10 or threshold > 150:
+            return {"status": "error", "message": "阈值必须在10到150之间"}, 400
+            
+        with night_vision_lock:
+            light_threshold = threshold
+            logger.info(f"光线阈值已设置为: {threshold}")
+            
+        return {"status": "success", "threshold": threshold, "message": f"光线阈值已设置为: {threshold:.1f}"}
+    except Exception as e:
+        logger.error(f"设置光线阈值失败: {e}")
+        return {"status": "error", "message": f"设置光线阈值失败: {e}"}, 500
